@@ -1,0 +1,29 @@
+server:
+  port: ${PORT:4001}
+
+spring:
+  application:
+    name: fitsphere
+  data:
+    mongodb:
+      uri: ${MONGODB_URI}
+      auto-index-creation: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    default-property-inclusion: non_null
+
+app:
+  client-origin: ${CLIENT_ORIGIN:http://localhost:5173}
+  jwt:
+    access-secret: ${JWT_ACCESS_SECRET}
+    refresh-secret: ${JWT_REFRESH_SECRET}
+    access-ttl-minutes: ${ACCESS_TOKEN_TTL_MINUTES:15}
+    refresh-ttl-days: ${REFRESH_TOKEN_TTL_DAYS:7}
+  socket:
+    enabled: ${SOCKET_ENABLED:true}
+    port: ${SOCKET_PORT:9093}
+
+logging:
+  level:
+    org.springframework.security: INFO
