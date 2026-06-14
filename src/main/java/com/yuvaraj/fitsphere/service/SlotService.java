@@ -23,6 +23,18 @@ import java.util.List;
 @Service
 public class SlotService {
 
+    // Slots are gym-wide and date-only, so "today"/"past" are judged in the gym's
+    // timezone (GYM_TZ_OFFSET, minutes east of UTC), not UTC.
+    private static final int GYM_OFFSET = parseOffset(System.getenv("GYM_TZ_OFFSET"));
+
+    private static int parseOffset(String v) {
+        try {
+            return v == null ? 0 : Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     private final SlotRepository slots;
     private final RealtimeService realtime;
 
@@ -34,7 +46,7 @@ public class SlotService {
     // ---- reads ----
 
     public ListByDate listByDate(String userId, String date) {
-        String target = date != null ? date : LocalDate.now(ZoneOffset.UTC).toString();
+        String target = date != null ? date : LocalDate.now(TimeUtil.offset(GYM_OFFSET)).toString();
         Instant from = dayStart(target);
         Instant to = from.plus(1, ChronoUnit.DAYS);
         List<SlotDto> dtos = slots.findInDay(from, to).stream()
@@ -44,7 +56,7 @@ public class SlotService {
     }
 
     public List<SlotDto> myBookings(String userId) {
-        Instant today = TimeUtil.startOfDay();
+        Instant today = TimeUtil.todayDateAtUtc(GYM_OFFSET);
         return slots.findByDateGreaterThanEqualOrderByDateAscStartTimeAsc(today).stream()
                 .filter(s -> s.getBookings().contains(userId) || s.getWaitlist().contains(userId))
                 .map(s -> toDto(s, userId))
@@ -55,7 +67,7 @@ public class SlotService {
 
     public SlotDto book(String slotId, String userId) {
         Slot slot = require(slotId);
-        if (slot.getDate().isBefore(TimeUtil.startOfDay())) {
+        if (slot.getDate().isBefore(TimeUtil.todayDateAtUtc(GYM_OFFSET))) {
             throw new HttpException(HttpStatus.CONFLICT, "This slot has already passed");
         }
         if (slot.getBookings().contains(userId)) {
@@ -88,7 +100,7 @@ public class SlotService {
 
     public SlotDto joinWaitlist(String slotId, String userId) {
         Slot slot = require(slotId);
-        if (slot.getDate().isBefore(TimeUtil.startOfDay())) {
+        if (slot.getDate().isBefore(TimeUtil.todayDateAtUtc(GYM_OFFSET))) {
             throw new HttpException(HttpStatus.CONFLICT, "This slot has already passed");
         }
         if (slot.getBookings().contains(userId)) {
@@ -123,7 +135,7 @@ public class SlotService {
             throw new HttpException(HttpStatus.BAD_REQUEST, "endTime must be after startTime");
         }
         Instant from = dayStart(in.date());
-        if (from.isBefore(TimeUtil.startOfDay())) {
+        if (from.isBefore(TimeUtil.todayDateAtUtc(GYM_OFFSET))) {
             throw new HttpException(HttpStatus.CONFLICT, "Cannot create a slot in the past");
         }
         assertNoOverlap(from, from.plus(1, ChronoUnit.DAYS), in.startTime(), in.endTime(), null);

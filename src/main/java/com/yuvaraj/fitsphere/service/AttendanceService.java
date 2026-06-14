@@ -42,6 +42,18 @@ public class AttendanceService {
     // so we bound the history loaded per summary instead of fetching it all.
     private static final int STREAK_WINDOW_DAYS = 400;
 
+    // Gym-wide timezone for GLOBAL metrics (live-occupancy day boundary, busiest
+    // hours) — minutes east of UTC. Personal stats use the caller's own offset.
+    private static final int GYM_OFFSET = parseOffset(System.getenv("GYM_TZ_OFFSET"));
+
+    private static int parseOffset(String v) {
+        try {
+            return v == null ? 0 : Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     private final AttendanceRepository attendance;
     private final GymConfigRepository gymConfig;
     private final RealtimeService realtime;
@@ -59,7 +71,7 @@ public class AttendanceService {
     }
 
     public Occupancy getOccupancy() {
-        int activeCount = (int) attendance.countByCheckOutAtIsNullAndCheckInAtGreaterThanEqual(TimeUtil.startOfDay());
+        int activeCount = (int) attendance.countByCheckOutAtIsNullAndCheckInAtGreaterThanEqual(TimeUtil.startOfDay(GYM_OFFSET));
         int cap = capacity();
         int percent = cap > 0 ? Math.round((activeCount / (float) cap) * 100) : 0;
         String level;
@@ -71,7 +83,7 @@ public class AttendanceService {
     }
 
     public AttendanceDto checkIn(String userId) {
-        Instant today = TimeUtil.startOfDay();
+        Instant today = TimeUtil.startOfDay(GYM_OFFSET);
         attendance.findFirstByUserAndCheckOutAtIsNull(userId).ifPresent(open -> {
             if (!open.getCheckInAt().isBefore(today)) {
                 throw new HttpException(HttpStatus.CONFLICT, "You are already checked in");
@@ -80,11 +92,21 @@ public class AttendanceService {
             attendance.save(open);
         });
 
-        if ("FULL".equals(getOccupancy().level())) {
+        // Occupancy is a count ACROSS documents, so capacity can't be guard-inserted
+        // atomically. Fast-reject when already full, then create and re-check: if this
+        // check-in pushed the gym over capacity, roll it back. Closes the read-then-
+        // create race; any near-simultaneous overlap self-corrects as members leave.
+        int cap = capacity();
+        if (attendance.countByCheckOutAtIsNullAndCheckInAtGreaterThanEqual(today) >= cap) {
             throw new HttpException(HttpStatus.CONFLICT, "The gym is at full capacity. Please try again later.");
         }
 
         Attendance record = attendance.save(new Attendance(userId, Instant.now()));
+        if (attendance.countByCheckOutAtIsNullAndCheckInAtGreaterThanEqual(today) > cap) {
+            attendance.deleteById(record.getId()); // we tipped it over — undo
+            throw new HttpException(HttpStatus.CONFLICT, "The gym is at full capacity. Please try again later.");
+        }
+
         realtime.emitOccupancy(getOccupancy());
         return new AttendanceDto(record.getId(), record.getCheckInAt(), record.getCheckOutAt());
     }
@@ -98,9 +120,9 @@ public class AttendanceService {
         return new AttendanceDto(open.getId(), open.getCheckInAt(), open.getCheckOutAt());
     }
 
-    private int computeStreak(Set<String> dayKeys) {
+    private int computeStreak(Set<String> dayKeys, int offsetMin) {
         int streak = 0;
-        LocalDate cursor = LocalDate.now(ZoneOffset.UTC);
+        LocalDate cursor = LocalDate.now(TimeUtil.offset(offsetMin));
         if (!dayKeys.contains(cursor.toString())) {
             cursor = cursor.minusDays(1);
             if (!dayKeys.contains(cursor.toString())) return 0;
@@ -112,27 +134,27 @@ public class AttendanceService {
         return streak;
     }
 
-    public Summary getSummary(String userId) {
+    public Summary getSummary(String userId, int offsetMin) {
         Attendance open = attendance.findFirstByUserAndCheckOutAtIsNull(userId).orElse(null);
         // Load only a bounded recent window (enough for streak + this week/month)
         // rather than the full history on every summary call.
-        Instant windowStart = TimeUtil.startOfDay().minus(STREAK_WINDOW_DAYS, ChronoUnit.DAYS);
+        Instant windowStart = TimeUtil.startOfDay(offsetMin).minus(STREAK_WINDOW_DAYS, ChronoUnit.DAYS);
         List<Attendance> recent = attendance.findByUserAndCheckInAtGreaterThanEqual(userId, windowStart);
         Occupancy occupancy = getOccupancy();
 
         Set<String> dayKeys = new LinkedHashSet<>();
         for (Attendance a : recent) {
-            dayKeys.add(TimeUtil.dayKey(a.getCheckInAt()));
+            dayKeys.add(TimeUtil.dayKey(a.getCheckInAt(), offsetMin));
         }
-        int streak = computeStreak(dayKeys);
+        int streak = computeStreak(dayKeys, offsetMin);
 
-        Instant weekStart = TimeUtil.startOfWeek();
-        Instant monthStart = TimeUtil.startOfMonth();
-        int thisWeek = (int) dayKeys.stream().filter(k -> !dayStart(k).isBefore(weekStart)).count();
-        int thisMonth = (int) dayKeys.stream().filter(k -> !dayStart(k).isBefore(monthStart)).count();
-        int allTime = countDistinctDays(userId); // server-side, never pulls full history
+        Instant weekStart = TimeUtil.startOfWeek(offsetMin);
+        Instant monthStart = TimeUtil.startOfMonth(offsetMin);
+        int thisWeek = (int) dayKeys.stream().filter(k -> !TimeUtil.dayStart(k, offsetMin).isBefore(weekStart)).count();
+        int thisMonth = (int) dayKeys.stream().filter(k -> !TimeUtil.dayStart(k, offsetMin).isBefore(monthStart)).count();
+        int allTime = countDistinctDays(userId, offsetMin); // server-side, never pulls full history
 
-        boolean checkedInToday = open != null && !open.getCheckInAt().isBefore(TimeUtil.startOfDay());
+        boolean checkedInToday = open != null && !open.getCheckInAt().isBefore(TimeUtil.startOfDay(offsetMin));
         Map<String, Boolean> milestones = new HashMap<>();
         milestones.put("3", streak >= 3);
         milestones.put("7", streak >= 7);
@@ -149,26 +171,27 @@ public class AttendanceService {
 
     /** All-time distinct attended days, computed in Mongo (groups by UTC day) so
      *  the full check-in history never leaves the database. */
-    private int countDistinctDays(String userId) {
+    private int countDistinctDays(String userId, int offsetMin) {
         Aggregation agg = Aggregation.newAggregation(
                 Aggregation.match(Criteria.where("user").is(userId)),
                 Aggregation.project()
-                        .and(DateOperators.DateToString.dateOf("checkInAt").toString("%Y-%m-%d"))
+                        .and(DateOperators.DateToString.dateOf("checkInAt").toString("%Y-%m-%d")
+                                .withTimezone(DateOperators.Timezone.valueOf(TimeUtil.offsetId(offsetMin))))
                         .as("day"),
                 Aggregation.group("day"));
         return mongo.aggregate(agg, Attendance.class, Document.class).getMappedResults().size();
     }
 
-    public Trend getTrend(String userId, int days) {
-        Instant since = TimeUtil.startOfDay().minus(days - 1L, ChronoUnit.DAYS);
+    public Trend getTrend(String userId, int days, int offsetMin) {
+        Instant since = TimeUtil.startOfDay(offsetMin).minus(days - 1L, ChronoUnit.DAYS);
         List<Attendance> records = attendance.findByUserAndCheckInAtGreaterThanEqual(userId, since);
         Set<String> present = new LinkedHashSet<>();
         for (Attendance r : records) {
-            present.add(TimeUtil.dayKey(r.getCheckInAt()));
+            present.add(TimeUtil.dayKey(r.getCheckInAt(), offsetMin));
         }
 
         List<DayPoint> series = new ArrayList<>();
-        LocalDate cursor = since.atZone(ZoneOffset.UTC).toLocalDate();
+        LocalDate cursor = since.atOffset(TimeUtil.offset(offsetMin)).toLocalDate();
         for (int i = 0; i < days; i++) {
             String key = cursor.toString();
             series.add(new DayPoint(key, present.contains(key) ? 1 : 0));
@@ -180,11 +203,12 @@ public class AttendanceService {
     }
 
     public BestTime getBestTime() {
-        Instant since = TimeUtil.daysAgo(30);
+        // Gym-wide busiest hours — grouped in the gym's timezone, not UTC.
+        Instant since = TimeUtil.daysAgo(30, GYM_OFFSET);
         List<Attendance> records = attendance.findByCheckInAtGreaterThanEqual(since);
         Map<Integer, Integer> byHour = new HashMap<>();
         for (Attendance r : records) {
-            byHour.merge(TimeUtil.hourOf(r.getCheckInAt()), 1, Integer::sum);
+            byHour.merge(TimeUtil.hourOf(r.getCheckInAt(), GYM_OFFSET), 1, Integer::sum);
         }
         List<HourCount> hours = new ArrayList<>();
         for (int h = 5; h <= 22; h++) {
@@ -198,15 +222,12 @@ public class AttendanceService {
         return new BestTime(hours, quietest, suggestion);
     }
 
-    public List<MonthEntry> getMonth(String userId, int year, int month) {
-        Instant from = LocalDate.of(year, month, 1).atStartOfDay(ZoneOffset.UTC).toInstant();
-        Instant to = LocalDate.of(year, month, 1).plusMonths(1).atStartOfDay(ZoneOffset.UTC).toInstant();
+    public List<MonthEntry> getMonth(String userId, int year, int month, int offsetMin) {
+        ZoneOffset z = TimeUtil.offset(offsetMin);
+        Instant from = LocalDate.of(year, month, 1).atStartOfDay(z).toInstant();
+        Instant to = LocalDate.of(year, month, 1).plusMonths(1).atStartOfDay(z).toInstant();
         return attendance.findByUserAndCheckInAtBetweenOrderByCheckInAtAsc(userId, from, to).stream()
-                .map(r -> new MonthEntry(r.getId(), r.getCheckInAt(), r.getCheckOutAt(), TimeUtil.dayKey(r.getCheckInAt())))
+                .map(r -> new MonthEntry(r.getId(), r.getCheckInAt(), r.getCheckOutAt(), TimeUtil.dayKey(r.getCheckInAt(), offsetMin)))
                 .toList();
-    }
-
-    private static Instant dayStart(String dayKey) {
-        return LocalDate.parse(dayKey).atStartOfDay(ZoneOffset.UTC).toInstant();
     }
 }

@@ -8,6 +8,7 @@ import com.yuvaraj.fitsphere.dto.AttendanceDtos.Summary;
 import com.yuvaraj.fitsphere.dto.AttendanceDtos.Trend;
 import com.yuvaraj.fitsphere.security.AppUser;
 import com.yuvaraj.fitsphere.service.AttendanceService;
+import com.yuvaraj.fitsphere.util.TimeUtil;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -41,19 +42,27 @@ public class AttendanceController {
         return attendance.checkOut(principal.id());
     }
 
+    // Client-supplied UTC offset (minutes east of UTC), clamped to ±14h. Personal
+    // day buckets (streak, calendar, week/month) use the caller's local day.
+    private static int tzOffset(Integer tz) {
+        return tz == null ? 0 : Math.max(-840, Math.min(840, tz));
+    }
+
     @GetMapping("/summary")
-    public Summary summary(@AuthenticationPrincipal AppUser principal) {
-        return attendance.getSummary(principal.id());
+    public Summary summary(@RequestParam(required = false) Integer tz, @AuthenticationPrincipal AppUser principal) {
+        return attendance.getSummary(principal.id(), tzOffset(tz));
     }
 
     @GetMapping("/month")
     public List<MonthEntry> month(@RequestParam(required = false) Integer year,
                                   @RequestParam(required = false) Integer month,
+                                  @RequestParam(required = false) Integer tz,
                                   @AuthenticationPrincipal AppUser principal) {
-        LocalDate today = LocalDate.now(ZoneOffset.UTC);
+        int off = tzOffset(tz);
+        LocalDate today = LocalDate.now(TimeUtil.offset(off));
         int y = year != null ? year : today.getYear();
         int m = month != null ? month : today.getMonthValue();
-        return attendance.getMonth(principal.id(), y, m);
+        return attendance.getMonth(principal.id(), y, m, off);
     }
 
     @GetMapping("/occupancy")
@@ -62,9 +71,9 @@ public class AttendanceController {
     }
 
     @GetMapping("/trend")
-    public Trend trend(@RequestParam(required = false) Integer days, @AuthenticationPrincipal AppUser principal) {
+    public Trend trend(@RequestParam(required = false) Integer days, @RequestParam(required = false) Integer tz, @AuthenticationPrincipal AppUser principal) {
         int d = Math.min(90, Math.max(7, days != null ? days : 14));
-        return attendance.getTrend(principal.id(), d);
+        return attendance.getTrend(principal.id(), d, tzOffset(tz));
     }
 
     @GetMapping("/best-time")
