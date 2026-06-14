@@ -15,6 +15,11 @@ import com.yuvaraj.fitsphere.realtime.RealtimeService;
 import com.yuvaraj.fitsphere.repository.AttendanceRepository;
 import com.yuvaraj.fitsphere.repository.GymConfigRepository;
 import com.yuvaraj.fitsphere.util.TimeUtil;
+import org.bson.Document;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.aggregation.Aggregation;
+import org.springframework.data.mongodb.core.aggregation.DateOperators;
+import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -33,14 +38,20 @@ import java.util.Set;
 @Service
 public class AttendanceService {
 
+    // Streaks longer than this aren't fully counted — >1 year at a daily cadence —
+    // so we bound the history loaded per summary instead of fetching it all.
+    private static final int STREAK_WINDOW_DAYS = 400;
+
     private final AttendanceRepository attendance;
     private final GymConfigRepository gymConfig;
     private final RealtimeService realtime;
+    private final MongoTemplate mongo;
 
-    public AttendanceService(AttendanceRepository attendance, GymConfigRepository gymConfig, RealtimeService realtime) {
+    public AttendanceService(AttendanceRepository attendance, GymConfigRepository gymConfig, RealtimeService realtime, MongoTemplate mongo) {
         this.attendance = attendance;
         this.gymConfig = gymConfig;
         this.realtime = realtime;
+        this.mongo = mongo;
     }
 
     private int capacity() {
@@ -103,11 +114,14 @@ public class AttendanceService {
 
     public Summary getSummary(String userId) {
         Attendance open = attendance.findFirstByUserAndCheckOutAtIsNull(userId).orElse(null);
-        List<Attendance> all = attendance.findByUser(userId);
+        // Load only a bounded recent window (enough for streak + this week/month)
+        // rather than the full history on every summary call.
+        Instant windowStart = TimeUtil.startOfDay().minus(STREAK_WINDOW_DAYS, ChronoUnit.DAYS);
+        List<Attendance> recent = attendance.findByUserAndCheckInAtGreaterThanEqual(userId, windowStart);
         Occupancy occupancy = getOccupancy();
 
         Set<String> dayKeys = new LinkedHashSet<>();
-        for (Attendance a : all) {
+        for (Attendance a : recent) {
             dayKeys.add(TimeUtil.dayKey(a.getCheckInAt()));
         }
         int streak = computeStreak(dayKeys);
@@ -116,6 +130,7 @@ public class AttendanceService {
         Instant monthStart = TimeUtil.startOfMonth();
         int thisWeek = (int) dayKeys.stream().filter(k -> !dayStart(k).isBefore(weekStart)).count();
         int thisMonth = (int) dayKeys.stream().filter(k -> !dayStart(k).isBefore(monthStart)).count();
+        int allTime = countDistinctDays(userId); // server-side, never pulls full history
 
         boolean checkedInToday = open != null && !open.getCheckInAt().isBefore(TimeUtil.startOfDay());
         Map<String, Boolean> milestones = new HashMap<>();
@@ -128,8 +143,20 @@ public class AttendanceService {
                 checkedInToday ? open.getCheckInAt() : null,
                 streak,
                 milestones,
-                new Totals(thisWeek, thisMonth, dayKeys.size()),
+                new Totals(thisWeek, thisMonth, allTime),
                 occupancy);
+    }
+
+    /** All-time distinct attended days, computed in Mongo (groups by UTC day) so
+     *  the full check-in history never leaves the database. */
+    private int countDistinctDays(String userId) {
+        Aggregation agg = Aggregation.newAggregation(
+                Aggregation.match(Criteria.where("user").is(userId)),
+                Aggregation.project()
+                        .and(DateOperators.DateToString.dateOf("checkInAt").toString("%Y-%m-%d"))
+                        .as("day"),
+                Aggregation.group("day"));
+        return mongo.aggregate(agg, Attendance.class, Document.class).getMappedResults().size();
     }
 
     public Trend getTrend(String userId, int days) {
