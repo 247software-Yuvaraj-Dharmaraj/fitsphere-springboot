@@ -198,7 +198,9 @@ public class DataSeeder implements CommandLineRunner {
     private void seedSlots(Instant base, List<User> members, User member, Random rnd) {
         // {startHour, endHour, capacity}
         int[][] times = {{6, 7, 15}, {7, 8, 20}, {12, 13, 12}, {17, 18, 20}, {18, 19, 25}, {19, 20, 20}};
-        List<String> memberIds = members.stream().map(User::getId).toList();
+        // Fill random bookings from everyone EXCEPT the demo member, so her "My Bookings"
+        // reflects only the slots we book her into explicitly (below) rather than every slot.
+        List<String> memberIds = members.stream().map(User::getId).filter(id -> !id.equals(member.getId())).toList();
         for (int d = 0; d < 7; d++) {
             Instant day = base.plus(d, ChronoUnit.DAYS);
             for (int[] t : times) {
