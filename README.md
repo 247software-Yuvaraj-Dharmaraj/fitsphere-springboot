@@ -2,6 +2,14 @@
 
 A **Java / Spring Boot** reimplementation of the [FitSphere](https://github.com/247software-Yuvaraj-Dharmaraj/fitsphere) backend (originally Node + Express + Mongoose). Same REST API contract, so the existing React frontend works unchanged.
 
+## Live demo
+
+- **API:** https://fitsphere-springboot.onrender.com (health: [`/api/health`](https://fitsphere-springboot.onrender.com/api/health)) — Render + MongoDB Atlas
+- **App:** https://fitsphere-java.vercel.app — the React frontend wired to this Java backend
+- **Demo logins** (password `password123`): `member@fitsphere.app` · `trainer@fitsphere.app` · `admin@fitsphere.app`
+
+> Hosted on Render's free tier — the API may take ~30–60s to wake on the first request.
+
 > Companion to [`incidentdesk-springboot`](https://github.com/247software-Yuvaraj-Dharmaraj/incidentdesk-springboot): that one is Spring + **JPA/PostgreSQL** (relational); this one is Spring + **MongoDB** (document) — the right datastore for each app.
 
 ## Tech stack
