@@ -207,7 +207,8 @@ public class DataSeeder implements CommandLineRunner {
                 s.setStartTime(String.format("%02d:00", t[0]));
                 s.setEndTime(String.format("%02d:00", t[1]));
                 s.setCapacity(t[2]);
-                int fill = Math.min(t[2], rnd.nextInt(t[2] / 2 + 1) + t[2] / 3);
+                // Clamp to the roster size — can't book more distinct members than exist.
+                int fill = Math.min(memberIds.size(), Math.min(t[2], rnd.nextInt(t[2] / 2 + 1) + t[2] / 3));
                 List<String> shuffled = new ArrayList<>(memberIds);
                 Collections.shuffle(shuffled, rnd);
                 for (int i = 0; i < fill; i++) {
