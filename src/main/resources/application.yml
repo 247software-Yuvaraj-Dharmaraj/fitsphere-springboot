@@ -15,10 +15,6 @@ spring:
 
 app:
   client-origin: ${CLIENT_ORIGIN:http://localhost:5173}
-  # TEMP (demo data): defaults ON so a deploy reseeds the rich demo dataset on every boot.
-  # To stop: set SEED_RESET=false, or revert the rich-seed commit.
-  seed:
-    reset: ${SEED_RESET:true}
   jwt:
     access-secret: ${JWT_ACCESS_SECRET}
     refresh-secret: ${JWT_REFRESH_SECRET}
